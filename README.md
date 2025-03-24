@@ -212,7 +212,7 @@ The global model is evaluated yearly using:
 
 - **Root Mean Squared Error (RMSE)**:
 
-\[ RMSE = \sqrt{\frac{1}{n}\sum_{i=1}^{n}(y_i - \hat{y}_i)^2} \]
+RMSE = √( (1/n) Σ (yᵢ - ŷᵢ)² )
 
 Lower RMSE indicates better prediction accuracy.
 
