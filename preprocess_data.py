@@ -127,10 +127,10 @@ def main():
             continue
 
         # Save .npy files
-        np.save(f"X_train_{year}.npy", X_train)
-        np.save(f"y_train_{year}.npy", y_train)
-        np.save(f"X_test_{year}.npy", X_test)
-        np.save(f"y_test_{year}.npy", y_test)
+        np.save(f"data/X_train_{year}.npy", X_train)
+        np.save(f"data/y_train_{year}.npy", y_train)
+        np.save(f"data/X_test_{year}.npy", X_test)
+        np.save(f"data/y_test_{year}.npy", y_test)
         print(f"Saved X_train_{year}.npy, y_train_{year}.npy, X_test_{year}.npy, y_test_{year}.npy")
 
 if __name__ == "__main__":

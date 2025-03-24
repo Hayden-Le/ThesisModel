@@ -79,8 +79,8 @@ def compute_rmse_on_year_data(model, year):
     """
     Loads Apple’s test data for the given year, evaluates MSE, returns RMSE.
     """
-    X_test = np.load(f"X_test_{year}.npy")
-    y_test = np.load(f"y_test_{year}.npy")
+    X_test = np.load(f"data/X_test_{year}.npy")
+    y_test = np.load(f"data/y_test_{year}.npy")
     mse = model.evaluate(X_test, y_test, verbose=0)
     rmse = math.sqrt(mse)
     return rmse

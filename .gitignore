@@ -4,12 +4,6 @@ myenv/
 # Ignore model files
 *.h5
 
-# Ignore numpy array files
-*.npy
-
-# Ignore dataset CSV files
-*.csv
-
 # Ignore system-specific files
 .DS_Store
 Thumbs.db
