@@ -1,130 +1,75 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Create a DataFrame for the dataset
-data = {
-    "Method": (["FedAvg"] * 13 + ["FedProx"] * 13 + ["FedDyn"] * 13 +
-               ["SCAFFOLD"] * 13 + ["MOON"] * 13),
-    "Round": list(range(1, 14)) * 5,
-    "RMSE": [
-        # FedAvg
-        0.7422088897963708, 1.3542588114456398, 0.9511385602179667, 1.272145143790863,
-        0.43756002933969973, 0.3870617176480972, 0.7457359331676454, 0.6545453195916472,
-        0.2724224526861334, 0.4033664962550175, 0.2687205610818497, 0.2760082054866559,
-        0.1952049474685827,
-        # FedProx
-        0.5814814058357971, 0.5415773949119072, 0.2712315085089795, 0.15847827768061198,
-        0.2817223362042418, 0.21542073818880444, 0.16779395457130483, 0.14822239154657652,
-        0.1372692795854872, 0.1305954157460098, 0.34727906653438123, 0.5183230635838956,
-        0.11919788604303617,
-        # FedDyn
-        0.9192596516910366, 1.525490982630706, 1.0633535279785673, 1.3467447834031523,
-        0.6299419497168467, 0.41852671235144984, 0.28317697635289824, 0.2735121237174593,
-        0.19687936813634407, 0.286223812742796, 0.1752666365247181, 0.2602935695989281,
-        0.4152382352869513,
-        # SCAFFOLD
-        0.9342478731342213, 1.0409019151894587, 0.5372000231043454, 0.598880078373896,
-        0.8157322416993782, 0.6490647482936661, 1.1157423239630473, 0.592062317687226,
-        0.5759996070133497, 0.45124750859719126, 0.9201324606800433, 0.5499072738644499,
-        0.8829566004749781,
-        # MOON
-        0.4933414319906191, 1.3021129046552455, 1.0406846327194106, 1.398856103365013,
-        0.6619822729502264, 0.4427565621841538, 0.2773890193223313, 0.2657067081838279,
-        0.19606923664557374, 0.20776427743120549, 0.15028847998472986, 0.14873768551831382,
-        0.2732660029138632,
-    ],
-}
+def load_custom_csv(filename):
+    """
+    Reads the CSV file that has a non-standard structure:
+    - A line containing the method name (no commas) indicates a new block.
+    - The next 13 lines contain comma-separated data:
+        Version, RMSE, MAE, R2, Timestamp
+    Returns a DataFrame with columns:
+      'Method', 'Version', 'RMSE', 'MAE', 'R2', 'Timestamp'
+    """
+    rows = []
+    current_method = None
+    with open(filename, 'r') as f:
+        for line in f:
+            line = line.strip()
+            # Check if the line has commas (data) or not (method name)
+            if ',' not in line:
+                # New method block
+                current_method = line
+            elif line:
+                # This is a data line; split it by comma
+                # Expecting 5 fields: Version, RMSE, MAE, R2, Timestamp
+                parts = line.split(',')
+                if len(parts) != 5:
+                    print("Skipping line (unexpected format):", line)
+                    continue
+                version, rmse, mae, r2, timestamp = parts
+                try:
+                    version = int(version.strip())
+                    rmse = float(rmse.strip())
+                    mae = float(mae.strip())
+                    r2 = float(r2.strip())
+                    timestamp = timestamp.strip()
+                except Exception as e:
+                    print("Error processing line:", line, "Error:", e)
+                    continue
+                # Append the row with the current method
+                rows.append({
+                    'Method': current_method,
+                    'Version': version,
+                    'RMSE': rmse,
+                    'MAE': mae,
+                    'R2': r2,
+                    'Timestamp': timestamp
+                })
+    df = pd.DataFrame(rows)
+    return df
 
-df = pd.DataFrame(data)
+def visualize_metrics(df):
+    # Print column names to check structure
+    print("Columns in DataFrame:", df.columns.tolist())
+    
+    metrics = ['RMSE', 'MAE', 'R2']
+    methods = df['Method'].unique()
+    
+    for metric in metrics:
+        plt.figure(figsize=(10, 6))
+        for method in methods:
+            df_method = df[df['Method'] == method].sort_values(by='Version')
+            plt.plot(df_method['Version'], df_method[metric], marker='o', label=method)
+        plt.xlabel('Global Model Version (Round)')
+        plt.ylabel(metric)
+        plt.title(f'{metric} vs Global Model Version for Different Fed Methods')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
 
-plt.figure(figsize=(8, 5))
-for method, grp in df.groupby("Method"):
-    plt.plot(grp["Round"], grp["RMSE"], marker='o', label=method)
-plt.xlabel("Round")
-plt.ylabel("RMSE")
-plt.title("RMSE over Rounds for Each Method")
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# Add MAE values to the DataFrame
-data["MAE"] = [
-    # FedAvg
-    0.566740872367456, 1.338448412314818, 0.8765538804685461, 1.259296837241866,
-    0.3209831835018226, 0.34353659394487285, 0.7154146441427431, 0.6384667715858073,
-    0.21350571717995423, 0.37584761969432484, 0.23224649401013242, 0.22883884890549794,
-    0.1656627889218897,
-    # FedProx
-    0.5420267859772, 0.5259642544791592, 0.2200480654607477, 0.11463258181013611,
-    0.232906051291737, 0.17403900582239848, 0.13960499985368097, 0.12403551772245584,
-    0.117832360393704, 0.11237007258249507, 0.31201776171198775, 0.5048015127641342,
-    0.09822840560484973,
-    # FedDyn
-    0.8006551868573234, 1.5153035566527158, 0.9903962618962332, 1.335619970863823,
-    0.540927831667378, 0.3734436253371937, 0.21124644686897637, 0.238989564686578,
-    0.15663718784952516, 0.2467132505062597, 0.14474126264555387, 0.2266428314131767,
-    0.3946967721666253,
-    # SCAFFOLD
-    0.8845222291805187, 1.0166508583661338, 0.4822426568206578, 0.5518165560032071,
-    0.8054126893115117, 0.6026899097242142, 1.1029279935847487, 0.5337159028979569,
-    0.5281862588192167, 0.4041058231606771, 0.9106603735395432, 0.49671552948628245,
-    0.8527836372899305,
-    # MOON
-    0.3199456181616178, 1.2846836177681924, 0.9607272764132251, 1.386535127862752,
-    0.561063996527394, 0.3973150820582992, 0.2029197983147314, 0.2331016147504161,
-    0.16158602872626252, 0.175573059237272, 0.12510387064577463, 0.1251421698181993,
-    0.225337255000362,
-]
-
-df["MAE"] = data["MAE"]
-
-plt.figure(figsize=(8, 5))
-for method, grp in df.groupby("Method"):
-    plt.plot(grp["Round"], grp["MAE"], marker='o', label=method)
-plt.xlabel("Round")
-plt.ylabel("MAE")
-plt.title("MAE over Rounds for Each Method")
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# Add R2 values to the DataFrame
-data["R2"] = [
-    # FedAvg
-    -14.14420471993525, -49.419380844641346, -23.87034133573055, -43.4905215655118,
-    -4.263437299289862, -3.1186473426008305, -14.288479956478175, -10.778055912640372,
-    -1.0402339288327327, -3.4729476328506426, -0.9851620463168009, -1.0942964430541364,
-    -0.04755252867217319,
-    # FedProx
-    -8.295350706405207, -7.063343742436237, -1.0224341746664347, 0.3095478251720015,
-    -1.181909226757098, -0.275760454798162, 0.22598970757139003, 0.39602112471619266,
-    0.4819868014302462, 0.5311326610297906, -2.3155175221746993, -6.385759882504066,
-    0.6094009135957226,
-    # FedDyn
-    -22.23115357113385, -62.97549702188821, -30.084918393254192, -48.86145907403478,
-    -9.909263695233296, -3.815492855155422, -1.204500793083533, -1.0565891595589152,
-    -0.0656014252439936, -1.2521945547979607, 0.1555131648457141, -0.8626071143845075,
-    -3.7401168998914773,
-    # SCAFFOLD
-    -22.994872166488136, -28.786112132868247, -6.933526016252949, -8.85993241578936,
-    -17.293190669658227, -10.581645032259978, -33.22331071408758, -8.63671570023557,
-    -8.120918584655865, -4.597883283495848, -22.275279728933015, -7.313293883804921,
-    -20.432504312496636,
-    # MOON
-    -5.690978134167858, -45.611353752423774, -28.773693525089453, -52.794826925016494,
-    -11.047228562359237, -4.389201770849348, -1.1153048287671008, -0.9408835020980737,
-    -0.056849987195559226, -0.18668700427903473, 0.37906546571090083, 0.39181392979973084,
-    -1.0528898110407048,
-]
-
-df["R2"] = data["R2"]
-
-plt.figure(figsize=(8, 5))
-for method, grp in df.groupby("Method"):
-    plt.plot(grp["Round"], grp["R2"], marker='o', label=method)
-plt.xlabel("Round")
-plt.ylabel("R2")
-plt.title("R2 over Rounds for Each Method")
-plt.legend()
-plt.tight_layout()
-plt.show()
+if __name__ == '__main__':
+    # Replace 'final_metric.csv' with your CSV file name
+    df = load_custom_csv('final_metric.csv')
+    print(df.head())  # optional: to check if data was loaded correctly
+    visualize_metrics(df)
