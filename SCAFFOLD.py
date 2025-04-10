@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
-import argparse
-import requests
-import tensorflow as tf
 import numpy as np
+import tensorflow as tf
+from flask import Flask, request, jsonify
+import time, os, csv
 import yfinance as yf
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 
-# --- Configuration ---
-sequence_length = 20
-d_model = 64
-server_url = "http://<server-tailscale-ip>:5000"  # Replace with your server's Tailscale IP
-learning_rate = 0.001  # learning rate for local training
+app = Flask(__name__)
 
-# --- Model Definition ---
+### Configuration ###
+NUM_CLIENTS = 3         # Number of expected client updates per round
+client_updates = []     # List to store received client updates
+global_model_version = 0  # Global model version counter
+sequence_length = 20    # Number of time steps per sample
+d_model = 64            # Embedding dimension of the model
+
+# Hyperparameters for SCAFFOLD (server side)
+eta = 0.001             # Local learning rate assumed on clients
+alpha = 0.1             # SCAFFOLD control variate update parameter
+
+# Global control variate, initialized to None and then to zero tensors once the first update is received.
+c_global = None
+
+### Model Definition ###
 def create_transformer_model():
-    """Creates a Transformer-based model (LLM-style) for time-series forecasting."""
     inputs = tf.keras.layers.Input(shape=(sequence_length, 1))
     x = tf.keras.layers.Dense(d_model)(inputs)
     attn_output = tf.keras.layers.MultiHeadAttention(num_heads=4, key_dim=d_model//4)(x, x)
@@ -28,181 +37,140 @@ def create_transformer_model():
     x = tf.keras.layers.GlobalAveragePooling1D()(x)
     outputs = tf.keras.layers.Dense(1)(x)
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    # We use a custom training loop so compile() is less critical.
     model.compile(loss='mse', optimizer='adam')
     return model
 
-# --- Data Download and Preprocessing for a Specific Year ---
-def download_apple_data_for_year(year, start_date=None, end_date=None):
-    """
-    Downloads Apple stock data via yfinance for a given year.
-    Defaults to full-year if start_date/end_date are not provided.
-    """
-    if start_date is None:
-        start_date = f"{year}-01-01"
-    if end_date is None:
-        end_date = f"{year+1}-01-01"
-    ticker = yf.Ticker("AAPL")
-    df = ticker.history(start=start_date, end=end_date)
-    df.reset_index(inplace=True)
-    df.sort_values("Date", inplace=True)
-    if df.empty:
-        raise ValueError(f"No data found for year {year}")
-    close_prices = df["Close"].values.reshape(-1, 1)
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled_prices = scaler.fit_transform(close_prices)
-    return scaled_prices, scaler
+global_model = create_transformer_model()
 
+### Data Preprocessing for Global Test Set ###
 def create_sequences(data, sequence_length):
     X, y = [], []
-    for i in range(len(data) - sequence_length):
+    for i in range(len(data)-sequence_length):
         X.append(data[i:i+sequence_length])
         y.append(data[i+sequence_length])
     return np.array(X), np.array(y)
 
-def partition_data_cyclically(X, y, client_id, num_clients, start_offset=11):
+def load_test_data(start_date="2023-01-01", end_date="2024-01-01"):
+    ticker = yf.Ticker("AAPL")
+    df = ticker.history(start=start_date, end=end_date)
+    df.reset_index(inplace=True)
+    df.sort_values("Date", inplace=True)
+    close_prices = df["Close"].values.reshape(-1, 1)
+    scaler = MinMaxScaler(feature_range=(0,1))
+    scaled_prices = scaler.fit_transform(close_prices)
+    X_test, y_test = create_sequences(scaled_prices, sequence_length)
+    return X_test, y_test, scaler
+
+### Metrics Calculation and Logging ###
+def compute_metrics(y_true, y_pred):
+    rmse = np.sqrt(np.mean((y_true - y_pred)**2))
+    mae = np.mean(np.abs(y_true - y_pred))
+    ss_res = np.sum((y_true - y_pred)**2)
+    ss_tot = np.sum((y_true - np.mean(y_true))**2)
+    r2 = 1 - ss_res/ss_tot if ss_tot != 0 else 0.0
+    return rmse, mae, r2
+
+def log_metrics(version, rmse, mae, r2):
+    file_name = "metrics.csv"
+    header = ["version", "rmse", "mae", "r2", "timestamp"]
+    exists = os.path.isfile(file_name)
+    with open(file_name, "a", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        if not exists:
+            writer.writerow(header)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        writer.writerow([version, rmse, mae, r2, timestamp])
+    print(f"Logged metrics: version={version}, RMSE={rmse:.4f}, MAE={mae:.4f}, R²={r2:.4f}")
+
+def test_global_model():
+    X_test, y_test, _ = load_test_data()
+    y_pred = global_model.predict(X_test)
+    rmse, mae, r2 = compute_metrics(y_test, y_pred)
+    print(f"Test metrics on global (2023) data: RMSE={rmse:.4f}, MAE={mae:.4f}, R²={r2:.4f}")
+    log_metrics(global_model_version, rmse, mae, r2)
+    global_model.save("aggregated_model.h5")
+    print("Aggregated model saved as aggregated_model.h5")
+
+### Server Endpoints ###
+@app.route("/get_model", methods=["GET"])
+def get_model():
+    weights = global_model.get_weights()
+    serialized = [w.tolist() for w in weights]
+    return jsonify({"weights": serialized, "version": global_model_version})
+
+@app.route("/post_update", methods=["POST"])
+def post_update():
     """
-    Partitions data cyclically starting at a given offset.
-    For start_offset=11 and num_clients=3:
-      - Client 0 gets indices: 11, 14, 17, 20, …
-      - Client 1 gets indices: 12, 15, 18, 21, …
-      - Client 2 gets indices: 13, 16, 19, 22, …
+    Receives raw model updates from clients (baseline training updates).
+    Implements a server-side SCAFFOLD aggregation.
+    
+    Let w_i be the weight tensor from client i. First, compute the simple average:
+      w_avg = (1/N) * sum_i w_i.
+    
+    Let w_global be the current global model weights.
+    We update the global control variate c_global (for each weight tensor) as:
+      c_new = (1 - alpha) * c_global + alpha * ((w_global - w_avg) / eta)
+    and then update the global model as:
+      w_new = w_avg - eta * c_new
     """
-    return X[start_offset + client_id::num_clients], y[start_offset + client_id::num_clients]
-
-# --- Serialization Functions ---
-def serialize_weights(weights):
-    return [w.tolist() for w in weights]
-
-def deserialize_weights(serialized_weights):
-    return [np.array(w) for w in serialized_weights]
-
-# --- Server Communication Functions ---
-def get_global_model():
-    response = requests.get(f"{server_url}/get_model")
-    data = response.json()
-    weights = deserialize_weights(data["weights"])
-    version = data["version"]
-    return weights, version
-
-def send_update(updated_weights):
-    payload = {"weights": serialize_weights(updated_weights)}
-    response = requests.post(f"{server_url}/post_update", json=payload)
-    return response.json()
-
-def wait_for_new_model(current_version):
-    params = {"version": current_version}
-    response = requests.get(f"{server_url}/wait_for_update", params=params)
-    data = response.json()
-    new_weights = deserialize_weights(data["weights"])
-    new_version = data["version"]
-    return new_weights, new_version
-
-# --- SCAFFOLD Local Training Function ---
-def initialize_c(global_weights):
-    """Initialize local control variate c_i as zeros with the same shape as global weights (float32)."""
-    return [tf.zeros_like(tf.cast(w, tf.float32)) for w in global_weights]
-
-def local_training_scaffold(global_weights, dataset, lr, c_i):
-    """
-    Performs one epoch of local training using a simplified SCAFFOLD update.
-    Here, we assume the global control variate c is 0.
-    The adjusted gradient is: g_adj = g - c_i.
-    Then, update weights: w <- w - lr * g_adj.
-    After each batch, update the local control variate as:
-      c_i <- c_i + (w_old - w_new) / lr.
-    """
-    model = create_transformer_model()
-    model.set_weights(global_weights)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-    mse = tf.keras.losses.MeanSquaredError()
-    train_loss = tf.keras.metrics.Mean(name='train_loss')
+    global client_updates, global_model, global_model_version, c_global, eta, alpha
+    data = request.get_json()
+    update_list = data.get("weights", [])
+    client_update = [np.array(w) for w in update_list]
+    client_updates.append(client_update)
+    print(f"Received update #{len(client_updates)} from a client.")
     
-    for X_batch, y_batch in dataset:
-        # Save weights before update
-        w_old = model.get_weights()
+    if len(client_updates) == NUM_CLIENTS:
+        print("All client updates received. Aggregating with server-side SCAFFOLD...")
+        # Compute simple average of client updates: w_avg
+        aggregated_weights = []
+        for weights_tuple in zip(*client_updates):
+            aggregated_weights.append(np.mean(np.array(weights_tuple), axis=0))
         
-        with tf.GradientTape() as tape:
-            y_pred = model(X_batch, training=True)
-            loss = mse(y_batch, y_pred)
-        grads = tape.gradient(loss, model.trainable_weights)
-        # Adjust gradients: subtract local control variate c_i
-        adjusted_grads = [g - c for g, c in zip(grads, c_i)]
-        optimizer.apply_gradients(zip(adjusted_grads, model.trainable_weights))
-        train_loss(loss)
+        # Get current global weights
+        current_global_weights = global_model.get_weights()
         
-        # Get new weights and update control variate:
-        w_new = model.get_weights()
-        new_c_i = []
-        # Update: c_i <- c_i + (w_old - w_new) / lr
-        for w_old_tensor, w_new_tensor, ci in zip(w_old, w_new, c_i):
-            # Cast to float32 to ensure consistency
-            delta = (tf.cast(w_old_tensor, tf.float32) - tf.cast(w_new_tensor, tf.float32)) / lr
-            new_ci = tf.cast(ci, tf.float32) + delta
-            new_c_i.append(new_ci)
-        c_i = new_c_i
-    print("SCAFFOLD Training Loss:", train_loss.result().numpy())
-    return model.get_weights(), c_i
+        # Initialize c_global if None
+        if c_global is None:
+            c_global = [np.zeros_like(w) for w in current_global_weights]
+        
+        new_c_global = []
+        new_global_weights = []
+        # Update the control variate and global weights tensor by tensor
+        for w_avg, w_global, c in zip(aggregated_weights, current_global_weights, c_global):
+            # Update control variate:
+            # c_new = (1 - alpha)*c + alpha*((w_global - w_avg)/eta)
+            c_new = (1 - alpha) * c + alpha * ((w_global - w_avg) / eta)
+            new_c_global.append(c_new)
+            # Update global weight: w_new = w_avg - eta * c_new
+            w_new = w_avg - eta * c_new
+            new_global_weights.append(w_new)
+        
+        c_global = new_c_global
+        global_model.set_weights(new_global_weights)
+        client_updates = []
+        global_model_version += 1
+        print(f"Global model updated. New version: {global_model_version}")
+        test_global_model()
+    
+    return jsonify({"status": "update received"})
 
-# --- Main Client Routine ---
-def main():
-    parser = argparse.ArgumentParser(description="Federated Learning Client with SCAFFOLD for Apple Data")
-    parser.add_argument("--client_id", type=int, required=True, help="Client ID (0-indexed)")
-    parser.add_argument("--num_clients", type=int, required=True, help="Total number of clients")
-    parser.add_argument("--start_year", type=int, default=2010, help="Start year for training (default: 2010)")
-    parser.add_argument("--end_year", type=int, default=2022, help="End year for training (default: 2022)")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for local training (default: 0.001)")
-    args = parser.parse_args()
-    
-    print(f"Client {args.client_id} of {args.num_clients} processing training years {args.start_year} to {args.end_year}")
-    
-    # Get the initial global model from the server
-    global_weights, version = get_global_model()
-    print(f"Initial global model version: {version}")
-    
-    # Initialize the local control variate c_i for SCAFFOLD
-    c_i = initialize_c(global_weights)
-    
-    # Process each training year (2010 to 2022)
-    for year in range(args.start_year, args.end_year + 1):
-        print(f"\nProcessing year {year}...")
-        # Download full-year data for the year
-        scaled_prices, _ = download_apple_data_for_year(year)
-        # Create sequences
-        X, y = create_sequences(scaled_prices, sequence_length)
-        print(f"Full-year data shape: X={X.shape}, y={y.shape}")
-        
-        # Partition data cyclically among clients starting at offset 11
-        X_local, y_local = partition_data_cyclically(X, y, args.client_id, args.num_clients, start_offset=11)
-        print(f"Client {args.client_id} data shape for year {year}: X={X_local.shape}, y={y_local.shape}")
-        
-        # Perform a local chronological train/validation split (80/20 split)
-        split_index = int(0.8 * len(y_local))
-        if split_index == 0:
-            print(f"Not enough data for training in year {year}. Skipping.")
-            continue
-        X_train, X_val = X_local[:split_index], X_local[split_index:]
-        y_train, y_val = y_local[:split_index], y_local[split_index:]
-        
-        # Create TensorFlow dataset for training
-        dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(20)
-        
-        print(f"Local training for year {year} on {len(y_train)} samples using SCAFFOLD...")
-        updated_weights, c_i = local_training_scaffold(global_weights, dataset, args.lr, c_i)
-        
-        # Send the updated weights to the server
-        response = send_update(updated_weights)
-        print(f"Update sent for year {year}: {response}")
-        
-        # Wait for the aggregated global model update from the server
-        print("Waiting for aggregated global model update...")
-        new_weights, new_version = wait_for_new_model(version)
-        print(f"Received new global model version: {new_version}")
-        global_weights, version = new_weights, new_version
-    
-    print("\nTraining complete for all years. Client exiting.")
+@app.route("/wait_for_update", methods=["GET"])
+def wait_for_update():
+    client_version = int(request.args.get("version", 0))
+    timeout = 30  # seconds
+    poll_interval = 1
+    waited = 0
+    while waited < timeout:
+        if global_model_version > client_version:
+            weights = global_model.get_weights()
+            serialized = [w.tolist() for w in weights]
+            return jsonify({"weights": serialized, "version": global_model_version})
+        time.sleep(poll_interval)
+        waited += poll_interval
+    weights = global_model.get_weights()
+    serialized = [w.tolist() for w in weights]
+    return jsonify({"weights": serialized, "version": global_model_version, "timeout": True})
 
 if __name__ == "__main__":
-    main()
-
-# python client.py --client_id 0 --num_clients 3 --start_year 2010 --end_year 2022 --lr 0.001
+    app.run(host="0.0.0.0", port=5000)

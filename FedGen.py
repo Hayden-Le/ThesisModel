@@ -10,14 +10,19 @@ from sklearn.preprocessing import MinMaxScaler
 app = Flask(__name__)
 
 ### Configuration ###
-NUM_CLIENTS = 3         # Number of expected client updates per round
+NUM_CLIENTS = 3         # Expected number of client updates per round
 client_updates = []     # To store received client updates
-global_model_version = 0  # Global model version
+global_model_version = 0  # Global model version number
 sequence_length = 20    # Number of time steps per sample
 d_model = 64            # Embedding dimension
-lambda_ntd = 0.1        # Hyperparameter for distillation weight
+mu = 0.1                # (Not used here; placeholder if needed for tuning)
 
-### Model Definition ###
+# Hyperparameters for FedGen distillation step:
+latent_dim = 10         # Dimension of noise input for the generator
+num_synthetic = 100     # Number of synthetic samples to generate
+distill_epochs = 1      # Number of distillation epochs
+
+### Base Model Definition ###
 def create_transformer_model():
     inputs = tf.keras.layers.Input(shape=(sequence_length, 1))
     x = tf.keras.layers.Dense(d_model)(inputs)
@@ -36,15 +41,32 @@ def create_transformer_model():
 
 global_model = create_transformer_model()
 
-### Data Preprocessing for Public (Test) Data ###
+### Generator Model Definition for FedGen ###
+def create_generator_model():
+    """
+    A simple generator model that takes noise as input and outputs synthetic sequences
+    of shape (sequence_length, 1). This model is used to approximate the client data distribution.
+    """
+    noise_input = tf.keras.layers.Input(shape=(latent_dim,))
+    x = tf.keras.layers.Dense(128, activation='relu')(noise_input)
+    x = tf.keras.layers.Dense(sequence_length, activation='sigmoid')(x)
+    x = tf.keras.layers.Reshape((sequence_length, 1))(x)
+    model = tf.keras.Model(inputs=noise_input, outputs=x)
+    model.compile(loss='mse', optimizer='adam')
+    return model
+
+# Initialize the generator (can be pre-trained or initialized randomly)
+generator_model = create_generator_model()
+
+### Data Preprocessing for Global Test Set ###
 def create_sequences(data, sequence_length):
     X, y = [], []
-    for i in range(len(data)-sequence_length):
+    for i in range(len(data) - sequence_length):
         X.append(data[i:i+sequence_length])
         y.append(data[i+sequence_length])
     return np.array(X), np.array(y)
 
-def load_public_data(start_date="2023-01-01", end_date="2024-01-01"):
+def load_test_data(start_date="2023-01-01", end_date="2024-01-01"):
     ticker = yf.Ticker("AAPL")
     df = ticker.history(start=start_date, end=end_date)
     df.reset_index(inplace=True)
@@ -52,8 +74,8 @@ def load_public_data(start_date="2023-01-01", end_date="2024-01-01"):
     close_prices = df["Close"].values.reshape(-1, 1)
     scaler = MinMaxScaler(feature_range=(0,1))
     scaled_prices = scaler.fit_transform(close_prices)
-    X_pub, y_pub = create_sequences(scaled_prices, sequence_length)
-    return X_pub, y_pub, scaler
+    X_test, y_test = create_sequences(scaled_prices, sequence_length)
+    return X_test, y_test, scaler
 
 ### Metrics and Logging ###
 def compute_metrics(y_true, y_pred):
@@ -77,30 +99,13 @@ def log_metrics(version, rmse, mae, r2):
     print(f"Logged metrics: version={version}, RMSE={rmse:.4f}, MAE={mae:.4f}, R²={r2:.4f}")
 
 def test_global_model():
-    X_pub, y_pub, _ = load_public_data()
-    y_pred = global_model.predict(X_pub)
-    rmse, mae, r2 = compute_metrics(y_pub, y_pred)
-    print(f"Test metrics on public (2023) data: RMSE={rmse:.4f}, MAE={mae:.4f}, R²={r2:.4f}")
+    X_test, y_test, _ = load_test_data()
+    y_pred = global_model.predict(X_test)
+    rmse, mae, r2 = compute_metrics(y_test, y_pred)
+    print(f"Test metrics on global (2023) data: RMSE={rmse:.4f}, MAE={mae:.4f}, R²={r2:.4f}")
     log_metrics(global_model_version, rmse, mae, r2)
     global_model.save("aggregated_model.h5")
     print("Aggregated model saved as aggregated_model.h5")
-
-### Distillation Loss Helper ###
-def distillation_loss(teacher_logits, student_logits, temperature=1.0):
-    """
-    Computes Kullback-Leibler divergence between teacher and student logits.
-    In this context, logits are the outputs (or soft predictions).
-    We use temperature scaling for softness.
-    """
-    # Scale logits
-    teacher_logits_scaled = teacher_logits / temperature
-    student_logits_scaled = student_logits / temperature
-    # Compute soft targets using softmax
-    teacher_soft = tf.nn.softmax(teacher_logits_scaled, axis=1)
-    student_soft = tf.nn.softmax(student_logits_scaled, axis=1)
-    # Compute KL divergence
-    kl = tf.keras.losses.KLDivergence()(teacher_soft, student_soft)
-    return kl
 
 ### Server Endpoints ###
 @app.route("/get_model", methods=["GET"])
@@ -112,16 +117,16 @@ def get_model():
 @app.route("/post_update", methods=["POST"])
 def post_update():
     """
-    Receives raw client updates and aggregates them using FedNTD.
-    Process:
-      1. Compute FedAvg to get w_avg.
-      2. Use a public dataset to obtain teacher signals from the current global model (w_global).
-      3. Initialize a temporary student model with w_avg.
-      4. Train the student model on the public dataset with a distillation loss that minimizes
-         the difference between its predictions and the teacher’s (global model’s) soft labels.
-      5. The updated student model becomes the new global model.
+    Receives client updates and aggregates them using FedGen.
+    
+    1. Compute the simple average of client updates: w_avg.
+    2. Use the generator model to synthesize pseudo-data.
+    3. Create a temporary model from w_avg (teacher model).
+    4. Perform a distillation step using the synthetic data to refine the global model.
+       That is, update the global model on synthetic data with teacher soft labels.
+    5. Update the global model weights and version.
     """
-    global client_updates, global_model, global_model_version, lambda_ntd
+    global client_updates, global_model, global_model_version, generator_model
     data = request.get_json()
     update_list = data.get("weights", [])
     client_update = [np.array(w) for w in update_list]
@@ -129,43 +134,43 @@ def post_update():
     print(f"Received update #{len(client_updates)} from a client.")
     
     if len(client_updates) == NUM_CLIENTS:
-        print("All client updates received. Aggregating with FedNTD...")
-        # 1. Compute simple average: w_avg
+        print("All client updates received. Aggregating with FedGen...")
+        # Step 1: Compute simple average of updates (FedAvg)
         aggregated_weights = []
         for weight_tuple in zip(*client_updates):
             aggregated_weights.append(np.mean(np.array(weight_tuple), axis=0))
         
-        # 2. Get current global weights (teacher: w_global)
-        w_global = global_model.get_weights()
+        # Create a temporary model with aggregated weights (teacher)
+        teacher_model = create_transformer_model()
+        teacher_model.set_weights(aggregated_weights)
         
-        # 3. Initialize a temporary student model with w_avg
-        student_model = create_transformer_model()
-        student_model.set_weights(aggregated_weights)
+        # Step 2: Generate synthetic data from noise using generator
+        noise = np.random.normal(size=(num_synthetic, latent_dim))
+        synthetic_data = generator_model.predict(noise)
+        # Note: synthetic_data has shape (num_synthetic, sequence_length, 1)
         
-        # 4. Use a public dataset (e.g., public data from 2023) for distillation
-        X_pub, y_pub, _ = load_public_data(start_date="2023-01-01", end_date="2024-01-01")
-        # Obtain teacher soft labels from the current global model
-        teacher_preds = global_model.predict(X_pub)
-        # Distill: Train the student model for a few epochs using teacher_preds as soft targets
-        # Here we use a simple MSE loss between the student's prediction and the teacher's prediction,
-        # scaled by lambda_ntd.
-        student_model.compile(loss='mse', optimizer=tf.keras.optimizers.Adam())
-        student_model.fit(X_pub, teacher_preds, epochs=1, verbose=0)
+        # Step 3: Perform a distillation step.
+        # We'll train the global model on synthetic data with teacher model outputs as targets.
+        teacher_preds = teacher_model.predict(synthetic_data)
+        # Set aggregated weights as initial weights of global model
+        global_model.set_weights(aggregated_weights)
+        # Distillation training step on synthetic data (can be a few epochs; here we use 1 epoch)
+        global_model.fit(synthetic_data, teacher_preds, epochs=distill_epochs, verbose=0)
         
-        # 5. Set the updated student weights as the new global model weights.
-        new_weights = student_model.get_weights()
+        # The refined weights become the new global model weights
+        new_weights = global_model.get_weights()
         global_model.set_weights(new_weights)
         client_updates = []
         global_model_version += 1
         print(f"Global model updated. New version: {global_model_version}")
         test_global_model()
-        
+    
     return jsonify({"status": "update received"})
 
 @app.route("/wait_for_update", methods=["GET"])
 def wait_for_update():
     client_version = int(request.args.get("version", 0))
-    timeout = 30
+    timeout = 30  # seconds max
     poll_interval = 1
     waited = 0
     while waited < timeout:
