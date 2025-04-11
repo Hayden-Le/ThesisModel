@@ -66,7 +66,11 @@ def visualize_metrics(df):
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.show()
+        # plt.show()
+
+        # Save the plot as a PNG file
+        plt.savefig(f'{metric}_vs_Global_Model_Version.png')
+        plt.close()
 
 if __name__ == '__main__':
     # Replace 'final_metric.csv' with your CSV file name
